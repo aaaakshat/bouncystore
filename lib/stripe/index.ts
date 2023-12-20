@@ -1,6 +1,8 @@
 import { HIDDEN_PRODUCT_TAG, SHOPIFY_GRAPHQL_API_ENDPOINT, TAGS } from 'lib/constants';
 import { isShopifyError } from 'lib/type-guards';
 import { ensureStartsWith } from 'lib/utils';
+import { revalidateTag } from 'next/cache';
+import { headers } from 'next/headers';
 import { NextRequest, NextResponse } from 'next/server';
 import {
   addToCartMutation,
@@ -54,7 +56,46 @@ const domain = process.env.SHOPIFY_STORE_DOMAIN
 const endpoint = `${domain}${SHOPIFY_GRAPHQL_API_ENDPOINT}`;
 const key = process.env.SHOPIFY_STOREFRONT_ACCESS_TOKEN!;
 
-type ExtractVariables<T> = T extends { variables: object } ? T['variables'] : never;
+export async function getProducts({
+  cache = 'force-cache',
+  headers,
+  query,
+}: {
+  cache?: RequestCache;
+  headers?: HeadersInit;
+  query: string;
+}): Promise<{ status: number; body: Product[] } | never> {
+  try {
+    const result = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Storefront-Access-Token': key,
+        ...headers
+      },
+      body: JSON.stringify({
+        ...(query && { query }),
+      }),
+      cache,
+    });
+
+    const body = await result.json();
+
+    if (body.errors) {
+      throw body.errors[0];
+    }
+
+    return {
+      status: result.status,
+      body
+    };
+  } catch (e) {
+    throw {
+      error: e,
+      query
+    };
+  }
+}
 
 export async function shopifyFetch<T>({
   cache = 'force-cache',
@@ -393,7 +434,7 @@ export async function getProductRecommendations(productId: string): Promise<Prod
   return reshapeProducts(res.body.data.productRecommendations);
 }
 
-export async function getProducts({
+export async function shopifyGetProducts({
   query,
   reverse,
   sortKey
@@ -417,5 +458,32 @@ export async function getProducts({
 
 // This is called from `app/api/revalidate.ts` so providers can control revalidation logic.
 export async function revalidate(req: NextRequest): Promise<NextResponse> {
+  // We always need to respond with a 200 status code to Shopify,
+  // otherwise it will continue to retry the request.
+  const collectionWebhooks = ['collections/create', 'collections/delete', 'collections/update'];
+  const productWebhooks = ['products/create', 'products/delete', 'products/update'];
+  const topic = headers().get('x-shopify-topic') || 'unknown';
+  const secret = req.nextUrl.searchParams.get('secret');
+  const isCollectionUpdate = collectionWebhooks.includes(topic);
+  const isProductUpdate = productWebhooks.includes(topic);
+
+  if (!secret || secret !== process.env.SHOPIFY_REVALIDATION_SECRET) {
+    console.error('Invalid revalidation secret.');
+    return NextResponse.json({ status: 200 });
+  }
+
+  if (!isCollectionUpdate && !isProductUpdate) {
+    // We don't need to revalidate anything for any other topics.
+    return NextResponse.json({ status: 200 });
+  }
+
+  if (isCollectionUpdate) {
+    revalidateTag(TAGS.collections);
+  }
+
+  if (isProductUpdate) {
+    revalidateTag(TAGS.products);
+  }
+
   return NextResponse.json({ status: 200, revalidated: true, now: Date.now() });
 }
